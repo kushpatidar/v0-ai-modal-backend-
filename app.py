@@ -5,13 +5,20 @@ import logging
 import os
 from datetime import datetime
 import re
+import csv
+import io
+from werkzeug.utils import secure_filename
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, origins="*", methods=["GET", "POST", "OPTIONS"], allow_headers=["Content-Type", "Authorization"])
+CORS(app, 
+     origins=["*"], 
+     methods=["GET", "POST", "OPTIONS"], 
+     allow_headers=["Content-Type", "Authorization", "Accept"],
+     supports_credentials=False)
 
 class FraudDetectionModel:
     def __init__(self):
@@ -113,9 +120,16 @@ def health_check():
         "timestamp": datetime.now().isoformat()
     })
 
-@app.route('/api/predict', methods=['POST'])
+@app.route('/api/predict', methods=['POST', 'OPTIONS'])
 def predict():
     """Main prediction endpoint"""
+    if request.method == 'OPTIONS':
+        response = jsonify()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add('Access-Control-Allow-Headers', "Content-Type, Authorization, Accept")
+        response.headers.add('Access-Control-Allow-Methods', "POST, OPTIONS")
+        return response
+        
     try:
         request_data = request.get_json()
         
@@ -143,11 +157,15 @@ def predict():
         
         logger.info(f"Prediction made: {result['prediction']} (confidence: {result['confidence']:.2f})")
         
-        return jsonify(result)
+        response = jsonify(result)
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response
         
     except Exception as e:
         logger.error(f"Prediction error: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+        response = jsonify({"error": "Internal server error"})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response, 500
 
 @app.route('/api/batch-predict', methods=['POST'])
 def batch_predict():
@@ -189,6 +207,134 @@ def model_info():
         "risk_factors": model.risk_factors
     })
 
+# File upload configuration
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+ALLOWED_EXTENSIONS = {'csv', 'json', 'txt'}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def parse_csv_file(file_content):
+    """Parse CSV file content and return list of transactions"""
+    transactions = []
+    csv_reader = csv.DictReader(io.StringIO(file_content))
+    
+    for row in csv_reader:
+        # Convert string values to appropriate types
+        transaction = {}
+        for key, value in row.items():
+            if key.lower() == 'amount':
+                try:
+                    transaction[key] = float(value)
+                except ValueError:
+                    transaction[key] = 0.0
+            else:
+                transaction[key] = value
+        transactions.append(transaction)
+    
+    return transactions
+
+def parse_json_file(file_content):
+    """Parse JSON file content and return list of transactions"""
+    try:
+        data = json.loads(file_content)
+        if isinstance(data, list):
+            return data
+        elif isinstance(data, dict) and 'transactions' in data:
+            return data['transactions']
+        else:
+            return [data]  # Single transaction
+    except json.JSONDecodeError:
+        raise ValueError("Invalid JSON format")
+
+@app.route('/api/upload-file', methods=['POST', 'OPTIONS'])
+def upload_file():
+    """File upload endpoint for batch transaction analysis"""
+    if request.method == 'OPTIONS':
+        response = jsonify()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add('Access-Control-Allow-Headers', "Content-Type, Authorization, Accept")
+        response.headers.add('Access-Control-Allow-Methods', "POST, OPTIONS")
+        return response
+        
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        
+        file = request.files['file']
+        
+        if file.filename == '':
+            return jsonify({"error": "No file selected"}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({"error": "File type not allowed. Use CSV, JSON, or TXT files"}), 400
+        
+        # Read file content
+        file_content = file.read().decode('utf-8')
+        
+        # Parse based on file extension
+        filename = secure_filename(file.filename)
+        file_ext = filename.rsplit('.', 1)[1].lower()
+        
+        if file_ext == 'csv':
+            transactions = parse_csv_file(file_content)
+        elif file_ext in ['json', 'txt']:
+            transactions = parse_json_file(file_content)
+        else:
+            return jsonify({"error": "Unsupported file format"}), 400
+        
+        if not transactions:
+            return jsonify({"error": "No valid transactions found in file"}), 400
+        
+        # Process transactions
+        results = []
+        fraud_count = 0
+        
+        for i, transaction in enumerate(transactions):
+            try:
+                result = model.predict(transaction)
+                result['transaction_id'] = i + 1
+                result['original_data'] = transaction
+                results.append(result)
+                
+                if result['prediction'] == 'fraud':
+                    fraud_count += 1
+                    
+            except Exception as e:
+                logger.error(f"Error processing transaction {i + 1}: {e}")
+                results.append({
+                    "transaction_id": i + 1,
+                    "error": str(e),
+                    "original_data": transaction
+                })
+        
+        # Summary statistics
+        total_transactions = len(results)
+        fraud_percentage = (fraud_count / total_transactions * 100) if total_transactions > 0 else 0
+        
+        response_data = {
+            "results": results,
+            "summary": {
+                "total_transactions": total_transactions,
+                "fraud_detected": fraud_count,
+                "legitimate_transactions": total_transactions - fraud_count,
+                "fraud_percentage": round(fraud_percentage, 2),
+                "filename": filename
+            }
+        }
+        
+        logger.info(f"File processed: {filename}, {total_transactions} transactions, {fraud_count} fraud detected")
+        
+        response = jsonify(response_data)
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response
+        
+    except Exception as e:
+        logger.error(f"File upload error: {e}")
+        response = jsonify({"error": f"File processing failed: {str(e)}"})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response, 500
+
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"error": "Endpoint not found"}), 404
@@ -202,8 +348,8 @@ def handle_preflight():
     if request.method == "OPTIONS":
         response = jsonify()
         response.headers.add("Access-Control-Allow-Origin", "*")
-        response.headers.add('Access-Control-Allow-Headers', "*")
-        response.headers.add('Access-Control-Allow-Methods', "*")
+        response.headers.add('Access-Control-Allow-Headers', "Content-Type, Authorization, Accept")
+        response.headers.add('Access-Control-Allow-Methods', "GET, POST, OPTIONS")
         return response
 
 if __name__ == '__main__':
